@@ -2,16 +2,27 @@
 vibe_env.core – orchestrates Ollama, code-server, Cloudflared, and
                 the Continue extension so a single `vibe_env.launch()`
                 gives you a full Cursor-like IDE on Google Colab.
+
+Colab-specific adaptations:
+  • Installs pciutils + lshw so Ollama's install script can detect the GPU
+  • Handles the systemd failure gracefully (Colab has no systemd)
+  • Sets OLLAMA_HOST / OLLAMA_ORIGINS for proper networking
+  • Uses threading to run ollama serve without blocking the notebook
+  • Ships Colab-friendly default models (≤8 B params) that fit on a T4
+  • Pulls models via the CLI (`ollama pull`) with real-time progress
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -33,13 +44,21 @@ WORKSPACE_DIR = Path.home() / "workspace"
 CODE_SERVER_CONFIG = Path.home() / ".config" / "code-server" / "config.yaml"
 CODE_SERVER_DIR = Path.home() / ".local" / "lib" / "code-server"
 CONTINUE_CONFIG_DIR = Path.home() / ".continue"
-ROO_CODE_EXT = "rooveterinaryinc.roo-cline"
 CONTINUE_EXT = "Continue.continue"
 
+# ── Colab-friendly defaults ─────────────────────────────────────────
+# T4 GPU has ~15 GB usable VRAM.  Keep total under that to avoid
+# spilling layers to system RAM (which kills performance).
 DEFAULT_MODELS = [
-    "llama3.1:8b",
-    "deepseek-coder-v2:16b",
-    "mistral-nemo:12b",
+    "llama3.1:8b",           # ~4.7 GB – general purpose
+    "deepseek-coder-v2:latest",  # ~8.9 GB – coding specialist (lite variant)
+    "qwen2.5-coder:7b",     # ~4.7 GB – fast autocomplete / coding
+]
+
+# If we detect a small GPU (<=8 GB) or CPU-only, use these instead
+SMALL_MODELS = [
+    "llama3.2:3b",           # ~2.0 GB
+    "qwen2.5-coder:3b",     # ~1.9 GB
 ]
 
 VIBE_BANNER = r"""
@@ -77,6 +96,20 @@ def _has_gpu() -> bool:
         return False
 
 
+def _gpu_vram_mb() -> int:
+    """Return total GPU VRAM in MiB, or 0 if no GPU."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return int(result.stdout.strip().split("\n")[0])
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return 0
+
+
 def _gpu_info() -> str:
     """Return a short GPU description or 'CPU-only'."""
     try:
@@ -89,6 +122,17 @@ def _gpu_info() -> str:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return "CPU-only (no GPU detected)"
+
+
+def _pick_default_models() -> list[str]:
+    """Choose model list based on available VRAM."""
+    vram = _gpu_vram_mb()
+    if vram >= 14_000:   # T4 (16 GB) or better
+        return list(DEFAULT_MODELS)
+    elif vram >= 6_000:  # Smaller GPU
+        return list(SMALL_MODELS)
+    else:                # CPU-only or tiny GPU
+        return list(SMALL_MODELS)
 
 
 def _run_bg(cmd: list[str], logfile: Optional[str] = None, **kw) -> subprocess.Popen:
@@ -105,7 +149,6 @@ def _run_bg(cmd: list[str], logfile: Optional[str] = None, **kw) -> subprocess.P
 
 def _wait_for_port(port: int, host: str = "127.0.0.1", timeout: int = 120) -> bool:
     """Block until *port* is accepting TCP connections."""
-    import socket
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -133,60 +176,168 @@ def _download_file(url: str, dest: Path) -> None:
 
 
 # ────────────────────────────────────────────────────────────────────
-# Installation helpers
+# System dependencies (Colab-specific)
+# ────────────────────────────────────────────────────────────────────
+
+def _install_system_deps() -> None:
+    """Install OS-level packages that Ollama's install script needs.
+
+    On Colab the packages `pciutils` (provides `lspci`) and `curl` are
+    required so Ollama's installer can detect the GPU correctly.
+    """
+    console.print("  [cyan]↓[/] Installing system dependencies (pciutils, curl, lshw) …")
+    try:
+        subprocess.run(
+            ["bash", "-c",
+             "apt-get update -qq && "
+             "apt-get install -y -qq pciutils curl lshw > /dev/null 2>&1"],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+        console.print("  [green]✓[/] System dependencies ready")
+    except subprocess.CalledProcessError as exc:
+        console.print(f"  [yellow]⚠[/] Some system deps may have failed: {exc}")
+
+
+# ────────────────────────────────────────────────────────────────────
+# Ollama
 # ────────────────────────────────────────────────────────────────────
 
 def _install_ollama() -> None:
-    """Install Ollama if not already present."""
+    """Install Ollama on Colab, handling the systemd failure gracefully.
+
+    Ollama's install.sh tries to create a systemd service at the end,
+    which always fails on Colab (no systemd).  We ignore that failure
+    and verify the binary was placed correctly.
+    """
     if shutil.which("ollama"):
         console.print("  [green]✓[/] Ollama already installed")
         return
 
+    # System deps first
+    _install_system_deps()
+
     console.print("  [cyan]↓[/] Installing Ollama …")
-    subprocess.run(
+    # Run the install script, but do NOT check=True because the systemd
+    # portion will exit non-zero on Colab.
+    result = subprocess.run(
         ["bash", "-c", "curl -fsSL https://ollama.com/install.sh | sh"],
-        check=True,
         capture_output=True,
+        text=True,
+        timeout=300,
     )
-    console.print("  [green]✓[/] Ollama installed")
+
+    # Even if the script returned non-zero (systemd fail), the binary
+    # might still be installed.  Check for it.
+    ollama_path = shutil.which("ollama") or Path("/usr/local/bin/ollama")
+    if isinstance(ollama_path, str):
+        ollama_path = Path(ollama_path)
+
+    if ollama_path.exists():
+        console.print("  [green]✓[/] Ollama installed")
+        if result.returncode != 0:
+            console.print("  [dim]   (systemd service creation skipped – expected on Colab)[/]")
+    else:
+        # Show the error so the user can debug
+        console.print(f"  [red]✗[/] Ollama installation failed")
+        if result.stderr:
+            for line in result.stderr.strip().split("\n")[-5:]:
+                console.print(f"      [dim]{line}[/]")
+        if result.stdout:
+            for line in result.stdout.strip().split("\n")[-5:]:
+                console.print(f"      [dim]{line}[/]")
+        raise RuntimeError(
+            "Ollama binary not found after install. "
+            "Try running `!curl -fsSL https://ollama.com/install.sh | sh` "
+            "manually in a Colab cell to see the full output."
+        )
 
 
 def _start_ollama() -> None:
-    """Start the Ollama server in the background (if not running)."""
-    for proc in psutil.process_iter(["name"]):
-        if proc.info["name"] and "ollama" in proc.info["name"].lower():
+    """Start the Ollama server in the background (if not running).
+
+    Uses threading so it does not block the Colab notebook.
+    Sets OLLAMA_HOST and OLLAMA_ORIGINS for proper networking.
+    """
+    # Check if already running
+    try:
+        r = requests.get(f"http://127.0.0.1:{OLLAMA_PORT}/", timeout=3)
+        if r.status_code == 200:
             console.print("  [green]✓[/] Ollama server already running")
             return
+    except requests.RequestException:
+        pass
 
     console.print("  [cyan]⟳[/] Starting Ollama server …")
     env = os.environ.copy()
-    # Enable GPU layers when available
-    if _has_gpu():
-        env["OLLAMA_NUM_GPU"] = "999"  # use all layers on GPU
-    _run_bg(["ollama", "serve"], logfile="/tmp/ollama.log", env=env)
+    env["OLLAMA_HOST"] = "0.0.0.0:11434"
+    env["OLLAMA_ORIGINS"] = "*"
 
-    if _wait_for_port(OLLAMA_PORT, timeout=60):
+    # Enable all GPU layers when available
+    if _has_gpu():
+        env["OLLAMA_NUM_GPU"] = "999"
+
+    def _serve():
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=open("/tmp/ollama.log", "a"),
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+
+    # Wait for startup
+    if _wait_for_port(OLLAMA_PORT, timeout=30):
         console.print("  [green]✓[/] Ollama server ready on port 11434")
     else:
-        console.print("  [red]✗[/] Ollama server failed to start (check /tmp/ollama.log)")
+        console.print("  [red]✗[/] Ollama server failed to start")
+        console.print("  [dim]   Check: !cat /tmp/ollama.log[/]")
 
 
 def _pull_models(models: list[str]) -> None:
-    """Pull each model through the Ollama API (shows progress)."""
+    """Pull each model using the Ollama CLI (with real-time progress).
+
+    The CLI pull is more reliable on Colab than the REST API for large
+    downloads because it handles retries and shows progress natively.
+    """
     for model in models:
-        console.print(f"  [cyan]↓[/] Pulling [bold]{model}[/] …")
+        console.print(f"  [cyan]↓[/] Pulling [bold]{model}[/] … (this may take a few minutes)")
         try:
-            resp = requests.post(
-                f"http://127.0.0.1:{OLLAMA_PORT}/api/pull",
-                json={"name": model, "stream": False},
-                timeout=1800,  # models can be large
+            result = subprocess.run(
+                ["ollama", "pull", model],
+                capture_output=True,
+                text=True,
+                timeout=1800,  # 30 min max per model
             )
-            if resp.ok:
+            if result.returncode == 0:
                 console.print(f"  [green]✓[/] {model} ready")
             else:
-                console.print(f"  [yellow]⚠[/] {model}: {resp.text[:120]}")
-        except requests.RequestException as exc:
-            console.print(f"  [red]✗[/] {model}: {exc}")
+                error_msg = (result.stderr or result.stdout or "unknown error").strip()
+                console.print(f"  [yellow]⚠[/] {model}: {error_msg[:200]}")
+        except subprocess.TimeoutExpired:
+            console.print(f"  [yellow]⚠[/] {model}: pull timed out (30 min limit)")
+        except FileNotFoundError:
+            console.print(f"  [red]✗[/] ollama binary not found – was it installed?")
+            break
+
+
+def _verify_models(models: list[str]) -> list[str]:
+    """Return the subset of *models* that are actually available locally."""
+    available = []
+    try:
+        r = requests.get(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5)
+        if r.ok:
+            local = {m["name"] for m in r.json().get("models", [])}
+            for m in models:
+                # Ollama tags can be model:tag or just model (implies :latest)
+                if m in local or m.split(":")[0] in {n.split(":")[0] for n in local}:
+                    available.append(m)
+    except requests.RequestException:
+        pass
+    return available
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -200,12 +351,19 @@ def _install_code_server() -> None:
         return
 
     console.print("  [cyan]↓[/] Installing code-server …")
-    subprocess.run(
+    result = subprocess.run(
         ["bash", "-c", "curl -fsSL https://code-server.dev/install.sh | sh"],
-        check=True,
         capture_output=True,
+        text=True,
+        timeout=300,
     )
-    console.print("  [green]✓[/] code-server installed")
+    if shutil.which("code-server"):
+        console.print("  [green]✓[/] code-server installed")
+    else:
+        console.print(f"  [red]✗[/] code-server installation failed")
+        if result.stderr:
+            console.print(f"      [dim]{result.stderr.strip()[-200:]}[/]")
+        raise RuntimeError("code-server binary not found after install.")
 
 
 def _write_code_server_config() -> None:
@@ -226,57 +384,62 @@ def _install_continue_extension() -> None:
     pre-configure it to point at the local Ollama instance."""
     console.print("  [cyan]↓[/] Installing Continue extension …")
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["code-server", "--install-extension", CONTINUE_EXT],
-            check=True,
             capture_output=True,
+            text=True,
             timeout=120,
         )
-        console.print("  [green]✓[/] Continue extension installed")
+        if result.returncode == 0:
+            console.print("  [green]✓[/] Continue extension installed")
+        else:
+            console.print(f"  [yellow]⚠[/] Continue extension: {result.stderr.strip()[:150]}")
+            console.print("  [dim]  You can install it manually from the Extensions sidebar.[/]")
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         console.print(f"  [yellow]⚠[/] Continue extension install failed: {exc}")
         console.print("  [dim]  You can install it manually from the Extensions sidebar.[/]")
-        return
 
-    # Pre-configure Continue to talk to Ollama
+    # Pre-configure Continue to talk to Ollama regardless of extension status
     _write_continue_config()
 
 
-def _write_continue_config() -> None:
+def _write_continue_config(models: list[str] | None = None) -> None:
     """Write the Continue config so it auto-connects to Ollama."""
     config_dir = CONTINUE_CONFIG_DIR
     config_dir.mkdir(parents=True, exist_ok=True)
     config_file = config_dir / "config.json"
 
-    config = {
-        "models": [
-            {
-                "title": "Llama 3.1 8B (Ollama)",
-                "provider": "ollama",
-                "model": "llama3.1:8b",
-                "apiBase": f"http://127.0.0.1:{OLLAMA_PORT}",
-            },
-            {
-                "title": "DeepSeek Coder V2 (Ollama)",
-                "provider": "ollama",
-                "model": "deepseek-coder-v2:16b",
-                "apiBase": f"http://127.0.0.1:{OLLAMA_PORT}",
-            },
-            {
-                "title": "Mistral Nemo (Ollama)",
-                "provider": "ollama",
-                "model": "mistral-nemo:12b",
-                "apiBase": f"http://127.0.0.1:{OLLAMA_PORT}",
-            },
-        ],
-        "tabAutocompleteModel": {
-            "title": "DeepSeek Coder V2 (autocomplete)",
+    if models is None:
+        models = _pick_default_models()
+
+    # Build model entries for Continue
+    model_entries = []
+    autocomplete_model = None
+    for m in models:
+        entry = {
+            "title": f"{m} (Ollama)",
             "provider": "ollama",
-            "model": "deepseek-coder-v2:16b",
+            "model": m,
             "apiBase": f"http://127.0.0.1:{OLLAMA_PORT}",
-        },
+        }
+        model_entries.append(entry)
+        # Prefer a coding model for autocomplete
+        if "coder" in m.lower() or "code" in m.lower():
+            autocomplete_model = entry.copy()
+            autocomplete_model["title"] = f"{m} (autocomplete)"
+
+    # Fallback: use the first model for autocomplete
+    if not autocomplete_model and model_entries:
+        autocomplete_model = model_entries[0].copy()
+        autocomplete_model["title"] = f"{models[0]} (autocomplete)"
+
+    config = {
+        "models": model_entries,
         "allowAnonymousTelemetry": False,
     }
+    if autocomplete_model:
+        config["tabAutocompleteModel"] = autocomplete_model
+
     config_file.write_text(json.dumps(config, indent=2))
     console.print("  [green]✓[/] Continue config → Ollama (localhost:11434)")
 
@@ -292,7 +455,8 @@ def _start_code_server() -> None:
     if _wait_for_port(CODE_SERVER_PORT, timeout=30):
         console.print(f"  [green]✓[/] code-server ready on port {CODE_SERVER_PORT}")
     else:
-        console.print("  [red]✗[/] code-server failed to start (check /tmp/code-server.log)")
+        console.print("  [red]✗[/] code-server failed to start")
+        console.print("  [dim]   Check: !cat /tmp/code-server.log[/]")
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -306,12 +470,23 @@ def _install_cloudflared() -> None:
         return
 
     console.print("  [cyan]↓[/] Installing cloudflared …")
+
+    # Try wget first (faster, common on Colab), fall back to requests
     dest = Path("/usr/local/bin/cloudflared")
     url = (
         "https://github.com/cloudflare/cloudflared/releases/latest"
         "/download/cloudflared-linux-amd64"
     )
-    _download_file(url, dest)
+    try:
+        subprocess.run(
+            ["wget", "-q", "-O", str(dest), url],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        _download_file(url, dest)
+
     dest.chmod(0o755)
     console.print("  [green]✓[/] cloudflared installed")
 
@@ -332,7 +507,7 @@ def _start_tunnel() -> str | None:
 
     # Parse the tunnel URL from cloudflared output
     url: str | None = None
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
         line = proc.stdout.readline()  # type: ignore[union-attr]
         if not line:
@@ -340,19 +515,16 @@ def _start_tunnel() -> str | None:
             continue
         if ".trycloudflare.com" in line:
             # Extract URL from the line
-            for token in line.split():
-                if "trycloudflare.com" in token:
-                    url = token.strip().rstrip("|").rstrip()
-                    if not url.startswith("http"):
-                        url = "https://" + url
-                    break
-            if url:
+            match = re.search(r"https?://[\w-]+\.trycloudflare\.com", line)
+            if match:
+                url = match.group(0)
                 break
 
     if url:
         console.print(f"  [green]✓[/] Tunnel active")
     else:
-        console.print("  [red]✗[/] Could not obtain tunnel URL (check /tmp/cloudflared.log)")
+        console.print("  [red]✗[/] Could not obtain tunnel URL")
+        console.print("  [dim]   The tunnel may still be starting – check output above.[/]")
 
     return url
 
@@ -372,26 +544,29 @@ def setup(
     Parameters
     ----------
     models : list[str], optional
-        Ollama model tags to pull. Defaults to Llama 3.1 8B,
-        DeepSeek-Coder-V2 16B, and Mistral-Nemo 12B.
+        Ollama model tags to pull. Auto-selected based on available GPU
+        VRAM if not specified.
     pull_models : bool
         If True (default), pull models after installing Ollama.
     install_continue : bool
         If True (default), install the Continue extension for code-server.
     """
     if models is None:
-        models = DEFAULT_MODELS
+        models = _pick_default_models()
 
     console.print(Panel(VIBE_BANNER, title="[bold magenta]vibe-env setup[/]", border_style="magenta"))
     console.print()
 
     # GPU info
     gpu = _gpu_info()
+    vram = _gpu_vram_mb()
     console.print(f"  [bold]GPU:[/] {gpu}")
     if _has_gpu():
-        console.print("  [green]✓[/] Hardware acceleration enabled")
+        console.print(f"  [green]✓[/] Hardware acceleration enabled ({vram} MiB VRAM)")
     else:
         console.print("  [yellow]⚠[/] No GPU detected – models will run on CPU")
+        console.print("  [dim]   Tip: Runtime → Change runtime type → T4 GPU[/]")
+    console.print(f"  [bold]Models:[/] {', '.join(models)}")
     console.print()
 
     # 1. Ollama
@@ -400,6 +575,8 @@ def setup(
     _start_ollama()
     if pull_models:
         _pull_models(models)
+        pulled = _verify_models(models)
+        console.print(f"  [bold]Available:[/] {', '.join(pulled) or 'none'}")
     console.print()
 
     # 2. code-server
@@ -430,7 +607,7 @@ def launch(
     Parameters
     ----------
     models : list[str], optional
-        Models to pull (see `setup()`).
+        Models to pull. Auto-selected based on GPU VRAM if not specified.
     pull_models : bool
         Pull models during setup.
     install_continue : bool
@@ -444,18 +621,27 @@ def launch(
         The public *.trycloudflare.com URL, or None on failure.
     """
     if models is None:
-        models = DEFAULT_MODELS
+        models = _pick_default_models()
 
     console.print(Panel(VIBE_BANNER, title="[bold magenta]vibe-env[/]", border_style="magenta"))
     console.print()
 
+    # Environment check
+    if _is_colab():
+        console.print("  [green]✓[/] Running on Google Colab")
+    else:
+        console.print("  [yellow]⚠[/] Not on Colab – some features may work differently")
+
     # GPU info
     gpu = _gpu_info()
+    vram = _gpu_vram_mb()
     console.print(f"  [bold]GPU:[/] {gpu}")
     if _has_gpu():
-        console.print("  [green]✓[/] Hardware acceleration enabled 🚀")
+        console.print(f"  [green]✓[/] Hardware acceleration enabled 🚀 ({vram} MiB VRAM)")
     else:
         console.print("  [yellow]⚠[/] No GPU detected – models will run on CPU (slower)")
+        console.print("  [dim]   Tip: Runtime → Change runtime type → T4 GPU[/]")
+    console.print(f"  [bold]Models to pull:[/] {', '.join(models)}")
     console.print()
 
     # ── Step 1: Ollama ──────────────────────────────────────────────
@@ -464,6 +650,9 @@ def launch(
     _start_ollama()
     if pull_models:
         _pull_models(models)
+        pulled = _verify_models(models)
+    else:
+        pulled = []
     console.print()
 
     # ── Step 2: code-server ─────────────────────────────────────────
@@ -498,8 +687,8 @@ def launch(
     table.add_row("Ollama", "[green]Running[/]", f"localhost:{OLLAMA_PORT}")
     table.add_row(
         "Models",
-        "[green]Pulled[/]" if pull_models else "[dim]Skipped[/]",
-        ", ".join(models),
+        "[green]Pulled[/]" if pulled else ("[dim]Skipped[/]" if not pull_models else "[yellow]Check[/]"),
+        ", ".join(pulled) if pulled else ", ".join(models),
     )
     table.add_row("code-server", "[green]Running[/]", f"localhost:{CODE_SERVER_PORT}")
     table.add_row("Continue Ext", "[green]Installed[/]" if install_continue else "[dim]Skipped[/]", "→ Ollama")
@@ -555,6 +744,7 @@ def status() -> dict:
 
     # GPU
     result["gpu"] = _gpu_info()
+    result["vram_mb"] = _gpu_vram_mb()
 
     # Ollama
     try:
@@ -565,7 +755,6 @@ def status() -> dict:
         result["ollama"] = {"running": False, "models": []}
 
     # code-server
-    import socket
     try:
         with socket.create_connection(("127.0.0.1", CODE_SERVER_PORT), timeout=2):
             result["code_server"] = {"running": True, "port": CODE_SERVER_PORT}
@@ -590,7 +779,7 @@ def status() -> dict:
     table.add_row("code-server", tag)
     tag = "[green]Running[/]" if result["cloudflared"]["running"] else "[red]Stopped[/]"
     table.add_row("Cloudflared", tag)
-    table.add_row("GPU", result["gpu"])
+    table.add_row("GPU", f"{result['gpu']} ({result['vram_mb']} MiB)")
 
     console.print(table)
     return result

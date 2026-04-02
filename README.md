@@ -9,12 +9,15 @@
 
 | Component | What it does |
 |---|---|
-| **Ollama** | Local model server — runs Llama 3.1, DeepSeek-Coder-V2, Mistral-Nemo on the Colab GPU |
+| **Ollama** | Local model server — runs Llama 3.1, DeepSeek-Coder-V2, Qwen2.5-Coder on the Colab GPU |
 | **code-server** | VS Code in the browser (the same editor you know and love) |
 | **Continue** | Open-source Cursor-like AI extension, pre-configured to talk to Ollama |
 | **Cloudflare Tunnel** | Free `.trycloudflare.com` URL — no accounts, no tokens |
 
 ## Quick Start (Colab)
+
+> **⚠️ Important:** Select a **GPU runtime** before running!  
+> Runtime → Change runtime type → **T4 GPU** (or better)
 
 ```python
 # Cell 1 — Install
@@ -26,6 +29,16 @@ url = vibe_env.launch()
 # Click the URL that appears → your IDE is ready 🚀
 ```
 
+## How It Works on Colab
+
+The package handles several Colab-specific quirks automatically:
+
+1. **Installs system deps** — `pciutils`, `lshw`, `curl` (needed for GPU detection)
+2. **Handles systemd failure** — Ollama's installer tries to create a systemd service, which doesn't exist on Colab. We catch this and run `ollama serve` via Python's `threading` instead
+3. **Auto-selects models by VRAM** — T4 GPU (16 GB) gets full-size models; smaller GPUs get 3B variants
+4. **Sets networking env vars** — `OLLAMA_HOST=0.0.0.0` and `OLLAMA_ORIGINS=*` so everything connects properly
+5. **Pulls models via CLI** — more reliable than the REST API for large downloads
+
 ## API
 
 ### `vibe_env.launch(**kwargs) → str | None`
@@ -34,12 +47,19 @@ All-in-one: install → configure → start → tunnel → print URL.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `models` | `list[str]` | See below | Ollama model tags to pull |
+| `models` | `list[str]` | Auto-detected | Ollama model tags to pull |
 | `pull_models` | `bool` | `True` | Whether to pull models |
 | `install_continue` | `bool` | `True` | Install the Continue extension |
 | `password` | `str \| None` | `None` | Optional password for code-server |
 
-**Default models:** `llama3.1:8b`, `deepseek-coder-v2:16b`, `mistral-nemo:12b`
+**Default models (T4 GPU / 16 GB VRAM):**
+- `llama3.1:8b` — general purpose (~4.7 GB)
+- `deepseek-coder-v2:latest` — coding specialist (~8.9 GB)
+- `qwen2.5-coder:7b` — coding + autocomplete (~4.7 GB)
+
+**Small GPU / CPU fallback:**
+- `llama3.2:3b` (~2.0 GB)
+- `qwen2.5-coder:3b` (~1.9 GB)
 
 ### `vibe_env.setup(**kwargs)`
 
@@ -67,7 +87,7 @@ Gracefully terminate all background processes (Ollama, code-server, cloudflared)
 │  │ • llama  │                            │       │
 │  │ • deep-  │                            │       │
 │  │   seek   │                     ┌──────┴──────┐│
-│  │ • mistral│                     │ cloudflared ││
+│  │ • qwen   │                     │ cloudflared ││
 │  └─────────┘                     └──────┬──────┘│
 │                                         │       │
 └─────────────────────────────────────────┼───────┘
@@ -77,11 +97,15 @@ Gracefully terminate all background processes (Ollama, code-server, cloudflared)
                                      🌐 You
 ```
 
-## Why This Architecture
+## Troubleshooting
 
-- **Ollama on Colab** — the most stable way to manage multiple open-source models in one environment. Handles switching between models seamlessly.
-- **code-server + Continue** — Continue is the closest open-source equivalent to Cursor. Pre-configured to `localhost:11434`, it gives you the "vibe coding" experience where the AI understands your whole codebase.
-- **Cloudflare Tunnels** — unlike ngrok, Cloudflare doesn't require an account or auth token for basic tunnels. It "just works" for anyone who imports the package.
+| Problem | Solution |
+|---|---|
+| `CalledProcessError` during Ollama install | Expected on Colab (systemd failure). The package handles this automatically — the binary still installs correctly. |
+| "No GPU detected" | Go to Runtime → Change runtime type → **T4 GPU** |
+| Model pull is slow | Large models can take 5-15 min. Use `models=["llama3.2:3b"]` for faster testing. |
+| Tunnel URL not appearing | Wait 30-45 seconds. Check `!cat /tmp/cloudflared.log` for errors. |
+| code-server won't start | Check `!cat /tmp/code-server.log` |
 
 ## Local Development
 
