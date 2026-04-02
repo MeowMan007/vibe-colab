@@ -9,9 +9,9 @@
 
 | Component | What it does |
 |---|---|
-| **Ollama** | Local model server — runs Llama 3.1, DeepSeek-Coder-V2, Qwen2.5-Coder on the Colab GPU |
+| **llama-cpp-python** | Local model server — runs HuggingFace GGUF models (Qwen2.5-Coder, Llama-3.2) on the Colab GPU. Bypasses all systemd requirements. |
 | **code-server** | VS Code in the browser (the same editor you know and love) |
-| **Continue** | Open-source Cursor-like AI extension, pre-configured to talk to Ollama |
+| **Continue** | Open-source Cursor-like AI extension, pre-configured to talk to your local model via its OpenAI API |
 | **Cloudflare Tunnel** | Free `.trycloudflare.com` URL — no accounts, no tokens |
 
 ## Quick Start (Colab)
@@ -33,11 +33,10 @@ url = vibe_env.launch()
 
 The package handles several Colab-specific quirks automatically:
 
-1. **Installs system deps** — `pciutils`, `lshw`, `curl` (needed for GPU detection)
-2. **Handles systemd failure** — Ollama's installer tries to create a systemd service, which doesn't exist on Colab. We catch this and run `ollama serve` via Python's `threading` instead
-3. **Auto-selects models by VRAM** — T4 GPU (16 GB) gets full-size models; smaller GPUs get 3B variants
-4. **Sets networking env vars** — `OLLAMA_HOST=0.0.0.0` and `OLLAMA_ORIGINS=*` so everything connects properly
-5. **Pulls models via CLI** — more reliable than the REST API for large downloads
+1. **Native Python Backend** — Swapped out Ollama for `llama-cpp-python` to avoid nasty `CalledProcessError` issues and tricky Linux daemon logic.
+2. **Auto-installs CUDA Wheels** — Grabs pre-compiled packages for 10x faster installation.
+3. **Downloads GGUF from HF Hub** — Pulls optimal quantized models directly from HuggingFace.
+4. **Auto-selects models by VRAM** — T4 GPU (16 GB) gets 7B parameters; smaller GPUs get 3B variants.
 
 ## API
 
@@ -47,65 +46,22 @@ All-in-one: install → configure → start → tunnel → print URL.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `models` | `list[str]` | Auto-detected | Ollama model tags to pull |
-| `pull_models` | `bool` | `True` | Whether to pull models |
+| `models` | `list[tuple[str, str]]` | Auto-detected | List of tuples `(huggingface_repo_id, gguf_filename)` |
+| `pull_models` | `bool` | `True` | Whether to pull models into `~/.cache` |
 | `install_continue` | `bool` | `True` | Install the Continue extension |
 | `password` | `str \| None` | `None` | Optional password for code-server |
 
-**Default models (T4 GPU / 16 GB VRAM):**
-- `llama3.1:8b` — general purpose (~4.7 GB)
-- `deepseek-coder-v2:latest` — coding specialist (~8.9 GB)
-- `qwen2.5-coder:7b` — coding + autocomplete (~4.7 GB)
+**Default model (T4 GPU / 16 GB VRAM):**
+- `unsloth/Qwen2.5-Coder-7B-Instruct-GGUF` (`qwen2.5-coder-7b-instruct-q4_k_m.gguf`)
 
 **Small GPU / CPU fallback:**
-- `llama3.2:3b` (~2.0 GB)
-- `qwen2.5-coder:3b` (~1.9 GB)
+- `unsloth/Llama-3.2-3B-Instruct-GGUF` (`llama-3.2-3b-instruct-q4_k_m.gguf`)
 
 ### `vibe_env.setup(**kwargs)`
-
-Same as `launch()` but only installs/configures — does **not** start services or open a tunnel. Useful for pre-warming an environment.
-
-### `vibe_env.status() → dict`
-
-Print and return the running status of all components.
+Same as `launch()` but only installs/configures — does **not** start services or open a tunnel. 
 
 ### `vibe_env.stop()`
-
-Gracefully terminate all background processes (Ollama, code-server, cloudflared).
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────┐
-│                  Google Colab                     │
-│                                                   │
-│  ┌─────────┐   ┌──────────────┐   ┌───────────┐ │
-│  │  Ollama  │◄──│  Continue     │──►│ code-     │ │
-│  │ :11434   │   │  Extension   │   │ server    │ │
-│  │          │   └──────────────┘   │ :8080     │ │
-│  │ Models:  │                      └─────┬─────┘ │
-│  │ • llama  │                            │       │
-│  │ • deep-  │                            │       │
-│  │   seek   │                     ┌──────┴──────┐│
-│  │ • qwen   │                     │ cloudflared ││
-│  └─────────┘                     └──────┬──────┘│
-│                                         │       │
-└─────────────────────────────────────────┼───────┘
-                                          │
-                              *.trycloudflare.com
-                                          │
-                                     🌐 You
-```
-
-## Troubleshooting
-
-| Problem | Solution |
-|---|---|
-| `CalledProcessError` during Ollama install | Expected on Colab (systemd failure). The package handles this automatically — the binary still installs correctly. |
-| "No GPU detected" | Go to Runtime → Change runtime type → **T4 GPU** |
-| Model pull is slow | Large models can take 5-15 min. Use `models=["llama3.2:3b"]` for faster testing. |
-| Tunnel URL not appearing | Wait 30-45 seconds. Check `!cat /tmp/cloudflared.log` for errors. |
-| code-server won't start | Check `!cat /tmp/code-server.log` |
+Gracefully terminate all background processes (`llama_cpp.server`, `code-server`, `cloudflared`).
 
 ## Local Development
 
