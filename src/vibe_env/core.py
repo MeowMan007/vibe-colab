@@ -151,7 +151,13 @@ def _download_file(url: str, dest: Path) -> None:
 # ────────────────────────────────────────────────────────────────────
 
 def _install_llama_cpp() -> None:
-    """Install llama-cpp-python from prebuilt CUDA wheels."""
+    """Install llama-cpp-python from prebuilt CUDA wheels.
+
+    IMPORTANT: We do NOT use capture_output=True here because pip install
+    can take 3-10 minutes (downloading large wheels or compiling from source).
+    Streaming output to the notebook lets the user see real progress and
+    prevents them from thinking the cell is frozen.
+    """
     try:
         import llama_cpp  # noqa: F401
         console.print("  [green]✓[/] llama-cpp-python already installed")
@@ -159,23 +165,45 @@ def _install_llama_cpp() -> None:
     except ImportError:
         pass
 
-    console.print("  [cyan]↓[/] Installing llama-cpp-python (with CUDA support) …")
-    
-    # We use a custom index for prebuilt wheels to avoid 15-minute compilation
-    # Fallback to normal PyPI if CPU-only
-    cmd = [sys.executable, "-m", "pip", "install", "llama-cpp-python[server]"]
+    console.print("  [cyan]↓[/] Installing llama-cpp-python … (this takes 2-5 min, output below)")
+    console.print()
+
+    # Try prebuilt CUDA wheels first (fast), fall back to source build
     if _has_gpu():
-        # Usually Colab has CUDA 12.x
-        cmd.extend(["--extra-index-url", "https://abetlen.github.io/llama-cpp-python/whl/cu121"])
-    
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
-        console.print("  [green]✓[/] llama-cpp-python installed")
-    except subprocess.CalledProcessError as exc:
-        console.print(f"  [red]✗[/] llama-cpp-python installation failed")
-        if exc.stderr:
-            console.print(f"      [dim]{exc.stderr.decode()[-200:]}[/]")
-        raise RuntimeError("Failed to install llama-cpp-python server.")
+        # Detect CUDA version on Colab
+        cuda_ver = "cu121"  # Colab default
+        try:
+            nvcc = subprocess.run(
+                ["nvcc", "--version"], capture_output=True, text=True, timeout=10
+            )
+            if "12.4" in nvcc.stdout:
+                cuda_ver = "cu124"
+            elif "12.2" in nvcc.stdout:
+                cuda_ver = "cu122"
+            elif "11.8" in nvcc.stdout:
+                cuda_ver = "cu118"
+        except Exception:
+            pass
+
+        wheel_url = f"https://abetlen.github.io/llama-cpp-python/whl/{cuda_ver}"
+        cmd = [
+            sys.executable, "-m", "pip", "install",
+            "llama-cpp-python[server]",
+            "--extra-index-url", wheel_url,
+            "--prefer-binary",
+        ]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "llama-cpp-python[server]"]
+
+    # Stream output live so the user sees progress in the notebook
+    proc = subprocess.run(cmd, timeout=600)  # no capture_output!
+
+    if proc.returncode != 0:
+        console.print(f"  [red]✗[/] llama-cpp-python installation failed (exit {proc.returncode})")
+        raise RuntimeError("Failed to install llama-cpp-python. Check pip output above.")
+
+    console.print()
+    console.print("  [green]✓[/] llama-cpp-python installed")
 
 def _pull_models(models: list[tuple[str, str]]) -> str:
     """Download GGUF models via huggingface_hub.
@@ -246,10 +274,11 @@ def _install_code_server() -> None:
         console.print("  [green]✓[/] code-server already installed")
         return
 
-    console.print("  [cyan]↓[/] Installing code-server …")
-    result = subprocess.run(
+    console.print("  [cyan]↓[/] Installing code-server … (output below)")
+    # Stream output live — no capture_output!
+    subprocess.run(
         ["bash", "-c", "curl -fsSL https://code-server.dev/install.sh | sh"],
-        capture_output=True, text=True, timeout=300,
+        timeout=300,
     )
     if shutil.which("code-server"):
         console.print("  [green]✓[/] code-server installed")
