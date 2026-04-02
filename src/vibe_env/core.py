@@ -205,53 +205,45 @@ def _install_system_deps() -> None:
 # ────────────────────────────────────────────────────────────────────
 
 def _install_ollama() -> None:
-    """Install Ollama on Colab, handling the systemd failure gracefully.
-
-    Ollama's install.sh tries to create a systemd service at the end,
-    which always fails on Colab (no systemd).  We ignore that failure
-    and verify the binary was placed correctly.
+    """Install Ollama manually by downloading the pre-compiled binary.
+    
+    This bypasses the official install.sh which tries to set up systemd
+    and can fail or raise CalledProcessError on Colab.
     """
     if shutil.which("ollama"):
         console.print("  [green]✓[/] Ollama already installed")
         return
 
-    # System deps first
+    # System deps first (for pciutils, lshw, etc)
     _install_system_deps()
 
-    console.print("  [cyan]↓[/] Installing Ollama …")
-    # Run the install script, but do NOT check=True because the systemd
-    # portion will exit non-zero on Colab.
-    result = subprocess.run(
-        ["bash", "-c", "curl -fsSL https://ollama.com/install.sh | sh"],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-
-    # Even if the script returned non-zero (systemd fail), the binary
-    # might still be installed.  Check for it.
-    ollama_path = shutil.which("ollama") or Path("/usr/local/bin/ollama")
-    if isinstance(ollama_path, str):
-        ollama_path = Path(ollama_path)
-
-    if ollama_path.exists():
-        console.print("  [green]✓[/] Ollama installed")
-        if result.returncode != 0:
-            console.print("  [dim]   (systemd service creation skipped – expected on Colab)[/]")
-    else:
-        # Show the error so the user can debug
-        console.print(f"  [red]✗[/] Ollama installation failed")
-        if result.stderr:
-            for line in result.stderr.strip().split("\n")[-5:]:
-                console.print(f"      [dim]{line}[/]")
-        if result.stdout:
-            for line in result.stdout.strip().split("\n")[-5:]:
-                console.print(f"      [dim]{line}[/]")
-        raise RuntimeError(
-            "Ollama binary not found after install. "
-            "Try running `!curl -fsSL https://ollama.com/install.sh | sh` "
-            "manually in a Colab cell to see the full output."
+    console.print("  [cyan]↓[/] Installing Ollama (manual binary download) …")
+    
+    # Download the linux-amd64 tarball manually
+    tar_url = "https://ollama.com/download/ollama-linux-amd64.tgz"
+    tar_path = Path("/tmp/ollama-linux-amd64.tgz")
+    
+    try:
+        _download_file(tar_url, tar_path)
+        
+        # Extract the binary using tar
+        subprocess.run(
+            ["tar", "-xzf", str(tar_path), "-C", "/usr/local"],
+            check=True,
+            capture_output=True
         )
+        
+        # Ensure it's executable
+        ollama_bin = Path("/usr/local/bin/ollama")
+        if ollama_bin.exists():
+            ollama_bin.chmod(0o755)
+            console.print("  [green]✓[/] Ollama installed successfully")
+        else:
+            raise FileNotFoundError("Ollama binary not found after extraction")
+            
+    except Exception as exc:
+        console.print(f"  [red]✗[/] Ollama installation failed: {exc}")
+        raise RuntimeError(f"Failed to install Ollama manually: {exc}")
 
 
 def _start_ollama() -> None:
